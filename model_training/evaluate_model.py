@@ -69,7 +69,13 @@ model = GRUDecoder(
 )
 
 # load model weights
-checkpoint = torch.load(os.path.join(model_path, 'checkpoint/best_checkpoint'), weights_only=False)
+# Load checkpoint and map to the selected device (helps on CPU-only machines where
+# checkpoints may have been serialized from a GPU-enabled run).
+checkpoint = torch.load(
+    os.path.join(model_path, 'checkpoint/best_checkpoint'),
+    map_location=device,
+    weights_only=False,
+)
 # rename keys to not start with "module." (happens if model was saved with DataParallel)
 for key in list(checkpoint['model_state_dict'].keys()):
     checkpoint['model_state_dict'][key.replace("module.", "")] = checkpoint['model_state_dict'].pop(key)
@@ -115,7 +121,9 @@ with tqdm(total=total_test_trials, desc='Predicting phoneme sequences', unit='tr
             neural_input = np.expand_dims(neural_input, axis=0)
 
             # convert to torch tensor
-            neural_input = torch.tensor(neural_input, device=device, dtype=torch.bfloat16)
+            # Use bfloat16 only on CUDA devices; CPU operations expect float32
+            tensor_dtype = torch.bfloat16 if (device.type != 'cpu' and torch.cuda.is_available()) else torch.float32
+            neural_input = torch.tensor(neural_input, device=device, dtype=tensor_dtype)
 
             # run decoding step
             logits = runSingleDecodingStep(neural_input, input_layer, model, model_args, device)
