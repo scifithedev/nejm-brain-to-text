@@ -1,10 +1,25 @@
 import os
+import sys
+import subprocess
+
+# If this process hasn't been launched through the environment/service helper,
+# re-run it via the helper which will ensure Redis + LM server are running in
+# `b2txt25_lm` and then invoke this script inside `b2txt25`. The helper will
+# set B2TXT_SKIP_ENV_CHECK=1 to avoid recursion.
+if os.environ.get('B2TXT_SKIP_ENV_CHECK') != '1':
+    helper = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scripts', 'run_with_services.sh')
+    lm_path = os.path.join('language_model', 'pretrained_language_models', 'openwebtext_1gram_lm_sil')
+    cmd = ['bash', helper, '--lm-path', lm_path, '--'] + sys.argv[1:]
+    ret = subprocess.call(cmd)
+    sys.exit(ret)
+
 import torch
 import numpy as np
 import pandas as pd
 import redis
 from omegaconf import OmegaConf
 import time
+import sys
 from tqdm import tqdm
 import editdistance
 import argparse
@@ -14,18 +29,39 @@ from evaluate_model_helpers import *
 
 # argument parser for command line arguments
 parser = argparse.ArgumentParser(description='Evaluate a pretrained RNN model on the copy task dataset.')
-parser.add_argument('--model_path', type=str, default='../data/t15_pretrained_rnn_baseline',
-                    help='Path to the pretrained model directory (relative to the current working directory).')
-parser.add_argument('--data_dir', type=str, default='../data/hdf5_data_final',
-                    help='Path to the dataset directory (relative to the current working directory).')
 parser.add_argument('--eval_type', type=str, default='test', choices=['val', 'test'],
                     help='Evaluation type: "val" for validation set, "test" for test set. '
                          'If "test", ground truth is not available.')
-parser.add_argument('--csv_path', type=str, default='../data/t15_copyTaskData_description.csv',
-                    help='Path to the CSV file with metadata about the dataset (relative to the current working directory).')
+parser.add_argument('--model_path', type=str, default='data/t15_pretrained_rnn_baseline',
+                    help='Path to the pretrained model directory (relative to the repository root).')
+parser.add_argument('--data_dir', type=str, default='data/hdf5_data_final',
+                    help='Path to the dataset directory (relative to the repository root).')
+parser.add_argument('--csv_path', type=str, default='data/t15_copyTaskData_description.csv',
+                    help='Path to the CSV file with metadata about the dataset (relative to the repository root).')
 parser.add_argument('--gpu_number', type=int, default=1,
                     help='GPU number to use for RNN model inference. Set to -1 to use CPU.')
+parser.add_argument('--max_trials', type=int, default=None,
+                    help='Optional: limit the total number of trials processed (useful for smoke tests).')
 args = parser.parse_args()
+
+# runtime environment safety check
+# Prevent accidental execution from the base environment. By default we expect
+# the evaluator to run in the `b2txt25` conda env. To override for debugging set
+# B2TXT_ALLOW_ENV_MISMATCH=1 in the environment.
+expected_env = os.environ.get('B2TXT_EXPECTED_ENV', 'b2txt25')
+allow_mismatch = os.environ.get('B2TXT_ALLOW_ENV_MISMATCH', '0') == '1'
+current_conda = os.environ.get('CONDA_DEFAULT_ENV') or os.environ.get('VIRTUAL_ENV')
+if not allow_mismatch:
+    if current_conda:
+        if expected_env not in current_conda:
+            print(f"ERROR: expected conda env '{expected_env}' but running in '{current_conda}'.\n"
+                  f"Activate the correct environment (e.g. 'conda activate {expected_env}') and retry.\n"
+                  "To bypass this check set B2TXT_ALLOW_ENV_MISMATCH=1.")
+            sys.exit(1)
+    else:
+        print(f"ERROR: no conda/virtualenv detected. Please activate '{expected_env}' and rerun.\n"
+              "To bypass this check set B2TXT_ALLOW_ENV_MISMATCH=1.")
+        sys.exit(1)
 
 # paths to model and data directories
 # Note: these paths are relative to the current working directory
@@ -104,9 +140,17 @@ for session in model_args['dataset']['sessions']:
 print(f'Total number of {eval_type} trials: {total_test_trials}')
 print()
 
+# apply optional global trial limit for smoke tests
+max_trials = args.max_trials if hasattr(args, 'max_trials') else None
+if max_trials is not None:
+    print(f'Limiting run to max {max_trials} trials (smoke test).')
+
 
 # put neural data through the pretrained model to get phoneme predictions (logits)
-with tqdm(total=total_test_trials, desc='Predicting phoneme sequences', unit='trial') as pbar:
+pbar_total = min(total_test_trials, max_trials) if max_trials is not None else total_test_trials
+with tqdm(total=pbar_total, desc='Predicting phoneme sequences', unit='trial') as pbar:
+    processed = 0
+    stop = False
     for session, data in test_data.items():
 
         data['logits'] = []
@@ -128,13 +172,21 @@ with tqdm(total=total_test_trials, desc='Predicting phoneme sequences', unit='tr
             # run decoding step
             logits = runSingleDecodingStep(neural_input, input_layer, model, model_args, device)
             data['logits'].append(logits)
-
+            processed += 1
             pbar.update(1)
+            if max_trials is not None and processed >= max_trials:
+                stop = True
+                break
+        if stop:
+            break
 pbar.close()
 
 
 # convert logits to phoneme sequences and print them out
 for session, data in test_data.items():
+    # skip sessions that were not processed due to a trial limit
+    if 'logits' not in data:
+        continue
     data['pred_seq'] = []
     for trial in range(len(data['logits'])):
         logits = data['logits'][trial][0]
@@ -191,7 +243,9 @@ lm_results = {
 
 # loop through all trials and put logits into the remote language model to get text predictions
 # note: this takes ~15-20 minutes to run on the entire test split with the 5-gram LM + OPT rescoring (RTX 4090)
-with tqdm(total=total_test_trials, desc='Running remote language model', unit='trial') as pbar:
+with tqdm(total=pbar_total, desc='Running remote language model', unit='trial') as pbar:
+    processed_lm = 0
+    stop_lm = False
     for session in test_data.keys():
         for trial in range(len(test_data[session]['logits'])):
             # get trial logits and rearrange them for the LM
@@ -241,7 +295,13 @@ with tqdm(total=total_test_trials, desc='Running remote language model', unit='t
             lm_results['pred_sentence'].append(best_candidate_sentence)
 
             # update progress bar
+            processed_lm += 1
             pbar.update(1)
+            if max_trials is not None and processed_lm >= max_trials:
+                stop_lm = True
+                break
+        if stop_lm:
+            break
 pbar.close()
 
 

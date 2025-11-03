@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/scifithedev/nejm-brain-to-text/language_model/language-model-standalone.py", line 824, in <module>
+    main(args)
+  File "/home/scifithedev/nejm-brain-to-text/language_model/language-model-standalone.py", line 444, in main
+    lm_path = os.path.expanduser(lm_path)
+  File "/home/scifithedev/miniconda3/envs/b2txt25_lm/lib/python3.9/posixpath.py", line 231, in expanduser
+    path = os.fspath(path)
+TypeError: expected str, bytes or os.PathLike object, not NoneType
