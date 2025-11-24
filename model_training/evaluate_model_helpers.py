@@ -86,17 +86,33 @@ def rearrange_speech_logits_pt(logits):
 # smooths data and puts it through the model.
 def runSingleDecodingStep(x, input_layer, model, model_args, device):
 
-    # Use autocast for efficiency
-    with torch.autocast(device_type = "cuda", enabled = model_args['use_amp'], dtype = torch.bfloat16):
-
+    # Use autocast for efficiency only if CUDA is available and use_amp is True
+    use_amp = model_args.get('use_amp', False)
+    cuda_available = torch.cuda.is_available() and device.type == 'cuda'
+    if use_amp and cuda_available:
+        with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+            x = gauss_smooth(
+                inputs = x,
+                device = device,
+                smooth_kernel_std = model_args['dataset']['data_transforms']['smooth_kernel_std'],
+                smooth_kernel_size = model_args['dataset']['data_transforms']['smooth_kernel_size'],
+                padding = 'valid',
+            )
+            with torch.no_grad():
+                logits, _ = model(
+                    x = x,
+                    day_idx = torch.tensor([input_layer], device=device),
+                    states = None, # no initial states
+                    return_state = True,
+                )
+    else:
         x = gauss_smooth(
-            inputs = x, 
+            inputs = x,
             device = device,
             smooth_kernel_std = model_args['dataset']['data_transforms']['smooth_kernel_std'],
             smooth_kernel_size = model_args['dataset']['data_transforms']['smooth_kernel_size'],
             padding = 'valid',
         )
-
         with torch.no_grad():
             logits, _ = model(
                 x = x,
@@ -105,13 +121,9 @@ def runSingleDecodingStep(x, input_layer, model, model_args, device):
                 return_state = True,
             )
 
-    # convert logits from bfloat16 to float32
+    # convert logits from bfloat16 to float32 (if needed)
     logits = logits.float().cpu().numpy()
-
-    # # original order is [BLANK, phonemes..., SIL]
-    # # rearrange so the order is [BLANK, SIL, phonemes...]
     # logits = rearrange_speech_logits_pt(logits)
-
     return logits
 
 def remove_punctuation(sentence):
